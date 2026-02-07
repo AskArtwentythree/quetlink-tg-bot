@@ -1,6 +1,7 @@
 /**
- * Локальное обратное геокодирование — та же логика, что в миниаппе (geocode-local.ts).
- * Координаты → ближайший крупный город и страна по данным cities5000.txt.
+ * Локальное обратное геокодирование по координатам.
+ * Для России: приоритетно russian-cities_with_english.json (русские названия, много городов).
+ * Для остального мира: cities5000.txt (все города из файла, не только крупные).
  */
 
 import { promises as fs } from "fs";
@@ -20,16 +21,18 @@ interface CityData {
   featureCode: string;
 }
 
-const MIN_POPULATION = 500_000;
-const MAJOR_CITY_FEATURE_CODES = new Set(["PPLC", "PPLA"]);
+interface RussianCityPoint {
+  name: string;
+  lat: number;
+  lon: number;
+}
+
 const EARTH_RADIUS_KM = 6371;
 const GRID_CELL_SIZE = 1.0;
-
-function isLargeCity(city: CityData): boolean {
-  if (city.population >= MIN_POPULATION) return true;
-  if (MAJOR_CITY_FEATURE_CODES.has(city.featureCode)) return true;
-  return false;
-}
+/** Максимальная дистанция (км), чтобы считать точку «в этом городе» для России */
+const MAX_RU_MATCH_KM = 80;
+/** Примерные границы России для быстрой проверки (широта, долгота) */
+const RU_BBOX = { latMin: 41, latMax: 82, lonMin: 19, lonMax: 180 };
 
 function haversineDistance(
   lat1: number,
@@ -51,7 +54,7 @@ function haversineDistance(
 
 function parseCityLine(line: string): CityData | null {
   const parts = line.split("\t");
-  if (parts.length < 9) return null;
+  if (parts.length < 15) return null;
   const name = parts[1]?.trim();
   const latStr = parts[4]?.trim();
   const lonStr = parts[5]?.trim();
@@ -92,15 +95,61 @@ function getNeighborGridKeys(lat: number, lon: number): string[] {
   return keys;
 }
 
+function inRussiaBbox(lat: number, lon: number): boolean {
+  return (
+    lat >= RU_BBOX.latMin &&
+    lat <= RU_BBOX.latMax &&
+    lon >= RU_BBOX.lonMin &&
+    lon <= RU_BBOX.lonMax
+  );
+}
+
 interface CityGridIndex {
   grid: Map<string, CityData[]>;
   cities: CityData[];
   isReady: boolean;
 }
 
+interface RussianGeoIndex {
+  grid: Map<string, RussianCityPoint[]>;
+  cities: RussianCityPoint[];
+  isReady: boolean;
+}
+
 let cityIndex: CityGridIndex | null = null;
-let loadPromise: Promise<CityGridIndex> | null = null;
+let russianGeoIndex: RussianGeoIndex | null = null;
+let loadPromise: Promise<void> | null = null;
 let russianNamesMap: Map<string, string> | null = null;
+
+async function loadRussianGeo(): Promise<RussianGeoIndex> {
+  if (russianGeoIndex?.isReady) return russianGeoIndex;
+  const jsonPath = join(DATA_DIR, "russian-cities_with_english.json");
+  const content = await fs.readFile(jsonPath, "utf-8");
+  const raw = JSON.parse(content) as Array<{
+    name: string;
+    english_name?: string;
+    coords?: { lat: string; lon: string };
+  }>;
+  const cities: RussianCityPoint[] = [];
+  const grid = new Map<string, RussianCityPoint[]>();
+
+  for (const c of raw) {
+    const latStr = c.coords?.lat;
+    const lonStr = c.coords?.lon;
+    if (!c.name?.trim() || latStr == null || lonStr == null) continue;
+    const lat = parseFloat(latStr);
+    const lon = parseFloat(lonStr);
+    if (Number.isNaN(lat) || Number.isNaN(lon)) continue;
+    const point: RussianCityPoint = { name: c.name.trim(), lat, lon };
+    cities.push(point);
+    const key = getGridKey(lat, lon);
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key)!.push(point);
+  }
+
+  russianGeoIndex = { grid, cities, isReady: true };
+  return russianGeoIndex;
+}
 
 async function loadRussianNamesMap(): Promise<Map<string, string>> {
   if (russianNamesMap) return russianNamesMap;
@@ -121,9 +170,13 @@ async function loadRussianNamesMap(): Promise<Map<string, string>> {
 
 async function loadCitiesAsync(): Promise<CityGridIndex> {
   if (cityIndex?.isReady) return cityIndex;
-  if (loadPromise) return loadPromise;
+  if (loadPromise) {
+    await loadPromise;
+    return cityIndex!;
+  }
 
   loadPromise = (async () => {
+    await loadRussianGeo();
     const filePath = join(DATA_DIR, "data_geo", "cities5000.txt");
     const content = await fs.readFile(filePath, "utf-8");
     const lines = content.split("\n");
@@ -134,7 +187,7 @@ async function loadCitiesAsync(): Promise<CityGridIndex> {
       const trimmed = line.trim();
       if (!trimmed) continue;
       const city = parseCityLine(trimmed);
-      if (city && isLargeCity(city)) {
+      if (city) {
         cities.push(city);
         const key = getGridKey(city.lat, city.lon);
         if (!grid.has(key)) grid.set(key, []);
@@ -143,23 +196,58 @@ async function loadCitiesAsync(): Promise<CityGridIndex> {
     }
 
     await loadRussianNamesMap();
-
     cityIndex = { grid, cities, isReady: true };
-    return cityIndex;
   })();
 
-  return loadPromise;
+  await loadPromise;
+  return cityIndex!;
 }
 
 /**
- * Находит ближайший город к координатам (как в миниаппе).
- * Возвращает строку для отображения: "г. Город, Страна".
+ * Ищет ближайший город в российском индексе в пределах MAX_RU_MATCH_KM.
+ */
+function findNearestRussianCity(
+  ruIndex: RussianGeoIndex,
+  lat: number,
+  lon: number
+): { name: string; distance: number } | null {
+  const keys = getNeighborGridKeys(lat, lon);
+  const candidates: RussianCityPoint[] = [];
+  for (const key of keys) {
+    const list = ruIndex.grid.get(key);
+    if (list) candidates.push(...list);
+  }
+  const toCheck = candidates.length > 0 ? candidates : ruIndex.cities;
+
+  let nearest: RussianCityPoint | null = null;
+  let minDist = Infinity;
+  for (const c of toCheck) {
+    const d = haversineDistance(lat, lon, c.lat, c.lon);
+    if (d < minDist) {
+      minDist = d;
+      nearest = c;
+    }
+  }
+  if (!nearest || minDist > MAX_RU_MATCH_KM) return null;
+  return { name: nearest.name, distance: minDist };
+}
+
+/**
+ * По координатам возвращает строку для отображения: "г. Город, Страна".
+ * Для России сначала ищет в russian-cities (русское название); иначе cities5000 + перевод по имени.
  */
 export async function reverseGeocodeDisplay(
   lat: number,
   lon: number
 ): Promise<string | null> {
-  const index = await loadCitiesAsync();
+  await loadCitiesAsync();
+
+  if (inRussiaBbox(lat, lon) && russianGeoIndex) {
+    const ru = findNearestRussianCity(russianGeoIndex, lat, lon);
+    if (ru) return `г. ${ru.name}, Россия`;
+  }
+
+  const index = cityIndex!;
   if (index.cities.length === 0) return null;
 
   const neighborKeys = getNeighborGridKeys(lat, lon);
